@@ -7,7 +7,7 @@ The source is a Postgres database (`shop`, schema `app`) that plays the role of 
 
 | File | Role |
 |---|---|
-| `generator/01_schema.sql` … `08_order_reviews.sql` | DDL, run in numeric order |
+| `generator/sql/01_schema.sql` … `08_order_reviews.sql` | DDL, run in numeric order |
 | `generator/load_olist.py` | One-off bulk load of the Olist CSVs from `data/olist/` (`--truncate` to reload) |
 | `generator/live_generator.py` | Endless loop that simulates live shop activity |
 
@@ -85,3 +85,47 @@ python generator/live_generator.py   # start the live traffic
 ```
 
 `.env` must define `PG_USER`, `PG_PASSWORD` and `PG_PORT`. `MESS_RATE`, `CANCEL_RATE` and `SLEEP_SECONDS` are optional.
+
+## Ingestion
+
+```
+Postgres app.* ──triggers──> app.cdc_log ──export_cdc.py──┐
+Frankfurter API ───────────────────fetch_fx.py────────────┼─> /Volumes/dev/bronze/landing/<table>/
+                                                          │            (JSON lines)
+                                      bronze_autoloader.py <─────────────┘
+                                                │
+                                                v
+                                       dev.bronze.<table> (Delta)
+```
+
+| Step | File | What it does |
+|---|---|---|
+| Capture | `generator/cdc/01_cdc_log.sql` | Triggers write every insert, update and delete into `app.cdc_log` |
+| Export | `ingestion/export_cdc.py` | `snapshot` copies every table once (`_op = 'S'`); `incremental` ships new `cdc_log` rows after the last exported `change_id` |
+| FX rates | `ingestion/fetch_fx.py` | `backfill` covers the Olist period (2016-09-01 to 2018-10-31), `daily` fetches the latest rates. One row per date and currency, with BRL as the base |
+| Load | `ingestion/bronze_autoloader.py` | Databricks notebook: Auto Loader reads the landing files into `dev.bronze.*` |
+
+Apply the CDC file after `load_olist.py`, so the bulk load does not flood the log. Then take the snapshot, then run incremental exports while the live generator is running.
+
+### Why trigger-based CDC
+
+- It needs nothing beyond plain Postgres and SQL. Log-based CDC (WAL with a tool such as Debezium) needs `wal_level=logical`, a replication slot and more infrastructure to run.
+- It captures hard deletes with the full last-known row. Polling on `updated_at` cannot see a deleted row at all.
+- `change_id` gives a single ordering of all changes, which is what the export watermark uses.
+- The cost is that every write also writes a log row in the same transaction, and it does not capture `TRUNCATE` or schema changes. That is acceptable for a demo-sized system.
+
+### At-least-once delivery
+
+`export_cdc.py` saves its watermark (`ingestion/state.json`, not committed) only after the upload succeeded. If it crashes mid-run, the next run resends the same changes instead of losing them. The result is possible duplicates, never gaps. Silver models must deduplicate on `_change_id`.
+
+### Append-only bronze
+
+Bronze never updates or deletes. Auto Loader appends every record it finds, with `_ingested_at` and `_source_file` added. A delete in Postgres therefore shows up in bronze as a new row with `_op = 'D'`, and an update as a new row with `_op = 'U'`. Nothing is lost, bronze can be rebuilt from the landing files, and the work of picking the current version of each row belongs to silver. New source columns are added to the Delta table automatically (`schemaEvolutionMode = addNewColumns`), which makes schema drift visible.
+
+Quick checks in Databricks after a run:
+
+```sql
+SELECT _op, COUNT(*) FROM dev.bronze.orders GROUP BY 1;            -- expect S, I, U
+SELECT COUNT(*) FROM dev.bronze.order_reviews WHERE _op = 'D';      -- deletes captured
+SELECT * FROM dev.bronze.fx_rates LIMIT 10;
+```
