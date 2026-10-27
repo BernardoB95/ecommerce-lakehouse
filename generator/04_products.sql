@@ -9,4 +9,4 @@ CREATE TABLE app.products (
     product_height_cm           NUMERIC,
     product_width_cm            NUMERIC,
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-)
+);
