@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: shop_db
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: shop
+    ports:
+      - "${PG_PORT}:5532"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./generator/sql:/docker-entrypoint-initdb.d
+volumes:
+  pgdata:
+
